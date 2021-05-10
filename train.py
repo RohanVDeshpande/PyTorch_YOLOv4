@@ -22,7 +22,7 @@ from models.models import *
 from utils.datasets import create_dataloader
 from utils.general import (
     check_img_size, torch_distributed_zero_first, labels_to_class_weights, plot_labels, check_anchors,
-    labels_to_image_weights, compute_loss, plot_images, fitness, strip_optimizer, plot_results,
+    labels_to_image_weights, compute_loss_ciou, compute_loss_giou, compute_loss_gioupp, plot_images, fitness, strip_optimizer, plot_results,
     get_latest_run, check_git_status, check_file, increment_dir, print_mutation, plot_evolution)
 from utils.google_utils import attempt_download
 from utils.torch_utils import init_seeds, ModelEMA, select_device, intersect_dicts
@@ -36,8 +36,15 @@ def train(hyp, opt, device, tb_writer=None):
     last = wdir + 'last.pt'
     best = wdir + 'best.pt'
     results_file = str(log_dir / 'results.txt')
-    epochs, batch_size, total_batch_size, weights, rank = \
-        opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank
+    epochs, batch_size, total_batch_size, weights, rank, loss_name = \
+        opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank, opt.loss
+
+    if loss_name == 'ciou':
+        loss_fn = compute_loss_ciou
+    elif loss_name == 'giou':
+        loss_fn = compute_loss_giou
+    elif loss_name == 'gioupp':
+        loss_fn = compute_loss_gioupp
 
     # TODO: Use DDP logging. Only the first process is allowed to log.
     # Save run settings
@@ -272,19 +279,20 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Print
             if rank in [-1, 0]:
-                mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-                mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
-                s = ('%10s' * 2 + '%10.4g' * 6) % (
-                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
-                pbar.set_description(s)
+                if loss_items:
+                    mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                    mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
+                    s = ('%10s' * 2 + '%10.4g' * 6) % (
+                        '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
+                    pbar.set_description(s)
 
-                # Plot
-                if ni < 3:
-                    f = str(log_dir / ('train_batch%g.jpg' % ni))  # filename
-                    result = plot_images(images=imgs, targets=targets, paths=paths, fname=f)
-                    if tb_writer and result is not None:
-                        tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
-                        # tb_writer.add_graph(model, imgs)  # add model to tensorboard
+                    # Plot
+                    if ni < 3:
+                        f = str(log_dir / ('train_batch%g.jpg' % ni))  # filename
+                        result = plot_images(images=imgs, targets=targets, paths=paths, fname=f)
+                        if tb_writer and result is not None:
+                            tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
+                            # tb_writer.add_graph(model, imgs)  # add model to tensorboard
 
             # end batch ------------------------------------------------------------------------------------------------
 
@@ -305,7 +313,8 @@ def train(hyp, opt, device, tb_writer=None):
                                                  model=ema.ema.module if hasattr(ema.ema, 'module') else ema.ema,
                                                  single_cls=opt.single_cls,
                                                  dataloader=testloader,
-                                                 save_dir=log_dir)
+                                                 save_dir=log_dir,
+                                                 compute_loss=loss_fn)
 
             # Write
             with open(results_file, 'a') as f:
@@ -315,11 +324,18 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Tensorboard
             if tb_writer:
-                tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',
-                        'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
-                        'val/giou_loss', 'val/obj_loss', 'val/cls_loss']
-                for x, tag in zip(list(mloss[:-1]) + list(results), tags):
-                    tb_writer.add_scalar(tag, x, epoch)
+                if loss_items:
+                    tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',
+                            'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
+                            'val/giou_loss', 'val/obj_loss', 'val/cls_loss']
+                    for x, tag in zip(list(mloss[:-1]) + list(results), tags):
+                        tb_writer.add_scalar(tag, x, epoch)
+                else:
+                    tags = ["train/" + loss_name + "_loss",
+                            'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
+                            "val/" + loss_name + "_loss"]
+                    for x, tag in zip(list(mloss) + list(results), tags):
+                        tb_writer.add_scalar(tag, x, epoch)
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
@@ -389,6 +405,7 @@ if __name__ == '__main__':
     parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
     parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
     parser.add_argument('--adam', action='store_true', help='use torch.optim.Adam() optimizer')
+    parser.add_argument('--loss', type=str, choices=["giou,gioupp,ciou"], required=True, help='loss function')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--logdir', type=str, default='runs/', help='logging directory')

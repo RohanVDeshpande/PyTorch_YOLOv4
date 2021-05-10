@@ -452,7 +452,7 @@ class BCEBlurWithLogitsLoss(nn.Module):
         return loss.mean()
 
 
-def compute_loss(p, targets, model):  # predictions, targets, model
+def compute_loss_ciou(p, targets, model):  # predictions, targets, model
     device = targets.device
     lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
     tcls, tbox, indices, anchors = build_targets(p, targets, model)  # targets
@@ -515,6 +515,44 @@ def compute_loss(p, targets, model):  # predictions, targets, model
 
     loss = lbox + lobj + lcls
     return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
+
+
+def compute_loss_giou(p, targets, model):
+    return compute_loss_giou_or_gioupp(False, p, targets, model)
+
+def compute_loss_gioupp(p, targets, model):
+    return compute_loss_giou_or_gioupp(True, p, targets, model)
+
+def compute_loss_giou_or_gioupp(gioupp, p, targets, model):  # gioupp flag, predictions, targets, model
+    device = targets.device
+    lbox = torch.zeros(1, device=device)
+    tcls, tbox, indices, anchors = build_targets(p, targets, model)  # targets
+    h = model.hyp  # hyperparameters
+
+    # Losses
+    nt = 0  # number of targets
+    np = len(p)  # number of outputs
+    for i, pi in enumerate(p):  # layer index, layer predictions
+        b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
+
+        n = b.shape[0]  # number of targets
+        if n:
+            nt += n  # cumulative targets
+            ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
+
+            # Regression
+            pxy = ps[:, :2].sigmoid() * 2. - 0.5
+            pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
+
+            pbox = torch.cat((pxy, pwh), 1).to(device)  # predicted box
+            giou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, GIoU=!gioupp, GIoUpp=gioupp)  # giou(prediction, target)
+            lbox += (1.0 - giou).mean()  # giou loss
+
+    s = 3 / np  # output count scaling
+    lbox *= h['giou'] * s
+    bs = pi.shape[0] # batch size
+
+    return lbox * bs, None
 
 
 def build_targets(p, targets, model):
